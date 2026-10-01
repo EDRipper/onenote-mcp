@@ -33,9 +33,11 @@ export class Graph {
     for (let attempt = 0; ; attempt++) {
       const token = await this.getToken(forceRefresh);
       const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-      let body: string | undefined;
+      let body: string | FormData | undefined;
       if (opts.body !== undefined) {
-        if (typeof opts.body === "string") {
+        if (opts.body instanceof FormData) {
+          body = opts.body; // fetch sets multipart/form-data with boundary
+        } else if (typeof opts.body === "string") {
           body = opts.body;
           headers["Content-Type"] = opts.contentType ?? "text/html";
         } else {

@@ -19,14 +19,41 @@ Claude ──OAuth (DCR + PKCE)──▶ this server ──OAuth──▶ Micros
 | `search_pages` | Title search across everything; optional full-text search within a notebook/section |
 | `read_page` | Page as Markdown (to-dos, tables, image references), or as HTML with element IDs |
 | `get_page_resource` | Fetch an embedded image so Claude can see it (diagrams, photos of the whiteboard) |
-| `create_page` | New page from Markdown. `- [ ]` becomes real OneNote checkboxes |
+| `create_page` | New page from Markdown. `- [ ]` becomes real OneNote checkboxes, and diagram blocks become images |
 | `append_to_page` | Add to the start or end of a page |
 | `update_page` | Rename, or replace/insert specific paragraphs |
+| `insert_diagram` | Draw a Mermaid or SVG diagram onto an existing page or a new one |
 | `delete_page` | Delete a page (flagged destructive so Claude asks first) |
 | `create_notebook` / `create_section` / `create_section_group` | Build structure |
 | `move_page` | Move (or copy) a page to another section |
 | `copy_section` | Copy a whole section into another notebook or folder, optionally renamed |
 | `whoami` | Which Microsoft account is connected |
+
+### Diagrams
+
+Claude can draw straight into your notes. Any page content can include:
+
+````markdown
+```mermaid Closed-loop motor control
+flowchart LR
+  Setpoint --> Controller --> Motor --> Encoder --> Controller
+```
+
+```svg Free-body diagram
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"> ... </svg>
+```
+````
+
+- **Mermaid** covers flowcharts and sequence, state, class, ER, Gantt and mind-map diagrams.
+- **SVG** covers everything else: circuits, free-body diagrams, mechanisms and annotated plots.
+
+Both are rendered to 2× PNGs on the server and uploaded into the page. OneNote stores pages as images and can't hold SVG directly. Any text after the language name becomes the alt text. If a diagram has a syntax error, the error goes back to Claude so it can fix the diagram and try again, and nothing is written to the page.
+
+How rendering works:
+
+- **SVG** uses [resvg](https://github.com/RazrFalcon/resvg). It runs no scripts and never fetches external resources.
+- **Mermaid** runs in headless Chromium with `securityLevel: "strict"`. All network requests are blocked, the Mermaid bundle is loaded from `node_modules`, and at most two renders run at once.
+- **No Chromium?** If the server can't start Chromium, Mermaid rendering returns an error telling Claude to use SVG instead.
 
 **What the Microsoft API can't do:** rename or delete notebooks and sections, or read handwriting/ink. Claude is told this, so it'll say so instead of failing quietly.
 
@@ -67,6 +94,8 @@ docker build -t onenote-mcp .
 docker run -p 3000:3000 --env-file .env onenote-mcp
 ```
 
+The Docker image includes Chromium and DejaVu fonts. When running outside Docker, set `CHROMIUM_PATH` to a Chromium or Chrome binary for Mermaid support.
+
 Set `DATABASE_URL` to a Postgres database for production. The server creates its one table (`kv`) on boot. Without a database it falls back to memory, and everyone has to reconnect after a restart.
 
 The server is stateless, so you can run as many replicas as you like behind a load balancer. All state lives in Postgres.
@@ -87,7 +116,7 @@ TEST_DATABASE_URL=postgres://... npm test         # same, against Postgres
 npm run dev
 ```
 
-The tests run the real OAuth flow end to end: discovery, dynamic registration, consent, Microsoft redirect, code exchange, refresh rotation and revocation. They then drive every tool through the official MCP client. They also cover Graph pagination, throttling retries and token expiry.
+The tests run the real OAuth flow end to end: discovery, dynamic registration, consent, Microsoft redirect, code exchange, refresh rotation and revocation. They then drive every tool through the official MCP client. They also cover Graph pagination, throttling retries, token expiry, and diagram uploads. For diagrams, the fake Graph parses the real multipart requests and checks that the PNGs arrive.
 
 ## Licence
 

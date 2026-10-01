@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Graph } from "./graph.js";
-import { buildPageHtml, contentToHtml, htmlToMarkdown } from "./convert.js";
+import { buildPageHtml, htmlToMarkdown, prepareContent, prepareMarkdown, type PageImage } from "./convert.js";
 
 const ON = "/me/onenote";
 const MAX_PAGE_CHARS = 100_000;
@@ -28,6 +28,32 @@ const enc = encodeURIComponent;
 const odataString = (s: string) => `'${s.replace(/'/g, "''")}'`;
 const formatSchema = z.enum(["markdown", "html"]).default("markdown")
   .describe("Format of `content`. Markdown supports headings, lists, tables, code, links and `- [ ]` to-do checkboxes.");
+
+const DIAGRAM_HELP =
+  " Diagrams: put a fenced ```mermaid block (flowcharts, sequence/state/class diagrams, Gantt, etc.) or a fenced ```svg block " +
+  "(full <svg> markup: circuits, free-body diagrams, labelled sketches, plots) in Markdown content and it is rendered to an image on the page. " +
+  "Text after the language becomes alt text, e.g. ```mermaid Control loop.";
+
+/** POST a new page, as multipart when it carries rendered images. */
+async function postPage(g: Graph, sectionId: string, title: string, html: string, images: PageImage[]) {
+  const page = buildPageHtml(title, html);
+  const path = `${ON}/sections/${encodeURIComponent(sectionId)}/pages`;
+  if (!images.length) return g.request("POST", path, { body: page, contentType: "application/xhtml+xml" });
+  const form = new FormData();
+  form.append("Presentation", new Blob([page], { type: "text/html" }));
+  for (const img of images) form.append(img.name, new Blob([new Uint8Array(img.png)], { type: "image/png" }), `${img.name}.png`);
+  return g.request("POST", path, { body: form });
+}
+
+/** PATCH page content, as multipart when commands reference rendered images. */
+async function patchPage(g: Graph, pageId: string, commands: unknown[], images: PageImage[]) {
+  const path = `${ON}/pages/${encodeURIComponent(pageId)}/content`;
+  if (!images.length) return g.request("PATCH", path, { body: commands });
+  const form = new FormData();
+  form.append("Commands", new Blob([JSON.stringify(commands)], { type: "application/json" }));
+  for (const img of images) form.append(img.name, new Blob([new Uint8Array(img.png)], { type: "image/png" }), `${img.name}.png`);
+  return g.request("PATCH", path, { body: form });
+}
 
 interface Container { kind: "notebook" | "sectionGroup"; id: string }
 function container(notebookId?: string, sectionGroupId?: string): Container {
@@ -300,7 +326,7 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
     "create_page",
     {
       title: "Create a page",
-      description: "Create a new page in a section.",
+      description: "Create a new page in a section." + DIAGRAM_HELP,
       inputSchema: {
         section_id: z.string(),
         title: z.string(),
@@ -310,11 +336,9 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
       annotations: WRITE,
     },
     safe(async (a: { section_id: string; title: string; content: string; format: "markdown" | "html" }, extra) => {
-      const page = await graphFor(extra.authInfo).request("POST", `${ON}/sections/${enc(a.section_id)}/pages`, {
-        body: buildPageHtml(a.title, contentToHtml(a.content, a.format)),
-        contentType: "application/xhtml+xml",
-      });
-      return json({ created: true, page_id: page.id, title: page.title, web_url: page.links?.oneNoteWebUrl?.href });
+      const { html, images } = await prepareContent(a.content, a.format);
+      const page = await postPage(graphFor(extra.authInfo), a.section_id, a.title, html, images);
+      return json({ created: true, page_id: page.id, title: page.title, diagrams: images.length || undefined, web_url: page.links?.oneNoteWebUrl?.href });
     }),
   );
 
@@ -322,7 +346,7 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
     "append_to_page",
     {
       title: "Add to a page",
-      description: "Add content to the end (or start) of an existing page without touching what's already there.",
+      description: "Add content to the end (or start) of an existing page without touching what's already there." + DIAGRAM_HELP,
       inputSchema: {
         page_id: z.string(),
         content: z.string(),
@@ -332,10 +356,9 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
       annotations: WRITE,
     },
     safe(async (a: { page_id: string; content: string; format: "markdown" | "html"; position: "end" | "start" }, extra) => {
-      await graphFor(extra.authInfo).request("PATCH", `${ON}/pages/${enc(a.page_id)}/content`, {
-        body: [{ target: "body", action: a.position === "end" ? "append" : "prepend", content: contentToHtml(a.content, a.format) }],
-      });
-      return text("Added to page.");
+      const { html, images } = await prepareContent(a.content, a.format);
+      await patchPage(graphFor(extra.authInfo), a.page_id, [{ target: "body", action: a.position === "end" ? "append" : "prepend", content: html }], images);
+      return text(images.length ? `Added to page (${images.length} diagram${images.length > 1 ? "s" : ""}).` : "Added to page.");
     }),
   );
 
@@ -345,7 +368,7 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
       title: "Edit or rename a page",
       description:
         "Rename a page and/or make targeted edits. For edits, call read_page with format=html first and target elements by their " +
-        "data-id as `#<data-id>` (or by `id` attribute). Actions: replace, append (inside the element, at end), prepend, insert (before/after).",
+        "data-id as `#<data-id>` (or by `id` attribute). Actions: replace, append (inside the element, at end), prepend, insert (before/after)." + DIAGRAM_HELP,
       inputSchema: {
         page_id: z.string(),
         title: z.string().optional().describe("New page title."),
@@ -365,13 +388,51 @@ export function registerTools(server: McpServer, graphFor: GraphFactory) {
     },
     safe(async (a: { page_id: string; title?: string; edits?: any[] }, extra) => {
       const commands: any[] = [];
+      const images: PageImage[] = [];
       if (a.title !== undefined) commands.push({ target: "title", action: "replace", content: a.title });
-      for (const e of a.edits ?? []) {
-        commands.push({ target: e.target, action: e.action, ...(e.position ? { position: e.position } : {}), content: contentToHtml(e.content, e.format) });
+      for (const [i, e] of (a.edits ?? []).entries()) {
+        const prepared = await prepareContent(e.content, e.format, `edit${i + 1}diagram`);
+        images.push(...prepared.images);
+        commands.push({ target: e.target, action: e.action, ...(e.position ? { position: e.position } : {}), content: prepared.html });
       }
       if (!commands.length) throw new Error("Nothing to change: give a title and/or edits.");
-      await graphFor(extra.authInfo).request("PATCH", `${ON}/pages/${enc(a.page_id)}/content`, { body: commands });
+      await patchPage(graphFor(extra.authInfo), a.page_id, commands, images);
       return text(`Applied ${commands.length} change(s).`);
+    }),
+  );
+
+  server.registerTool(
+    "insert_diagram",
+    {
+      title: "Draw a diagram",
+      description:
+        "Render a diagram and put it in OneNote, either at the end/start of an existing page (page_id) or as a new page (section_id + title). " +
+        "kind=mermaid for flowcharts, sequence, state, class, ER, Gantt, mindmaps, etc. " +
+        "kind=svg for anything Mermaid can't draw (circuits, free-body diagrams, mechanisms, annotated graphs): pass a complete <svg> with width/height or a viewBox; " +
+        "use plain shapes, paths and <text> (no scripts, external images or web fonts). Rendering errors are returned so you can fix the source and retry.",
+      inputSchema: {
+        kind: z.enum(["mermaid", "svg"]),
+        source: z.string().describe("Mermaid code, or full SVG markup."),
+        caption: z.string().optional().describe("Shown in italics under the diagram; also used as alt text."),
+        page_id: z.string().optional().describe("Add to this existing page."),
+        position: z.enum(["end", "start"]).default("end"),
+        section_id: z.string().optional().describe("Or create a new page in this section."),
+        title: z.string().optional().describe("Title for the new page (with section_id)."),
+      },
+      annotations: WRITE,
+    },
+    safe(async (a: { kind: "mermaid" | "svg"; source: string; caption?: string; page_id?: string; position: "end" | "start"; section_id?: string; title?: string }, extra) => {
+      if (!!a.page_id === !!a.section_id) throw new Error("Provide exactly one of page_id (add to a page) or section_id (new page).");
+      const fence = "~~~~~~~~";
+      const markdown = `${fence}${a.kind} ${a.caption ?? ""}\n${a.source}\n${fence}${a.caption ? `\n\n*${a.caption}*` : ""}`;
+      const { html, images } = await prepareMarkdown(markdown);
+      const g = graphFor(extra.authInfo);
+      if (a.page_id) {
+        await patchPage(g, a.page_id, [{ target: "body", action: a.position === "end" ? "append" : "prepend", content: html }], images);
+        return text("Diagram added to page.");
+      }
+      const page = await postPage(g, a.section_id!, a.title ?? a.caption ?? "Diagram", html, images);
+      return json({ created: true, page_id: page.id, title: page.title, web_url: page.links?.oneNoteWebUrl?.href });
     }),
   );
 

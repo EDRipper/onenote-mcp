@@ -16,7 +16,8 @@ const INSTRUCTIONS = `Tools for the user's Microsoft OneNote.
 Hierarchy: notebook → section groups (folders, can nest) → sections (tabs) → pages (and subpages).
 Start with list_notebooks or get_notebook_structure to get IDs; IDs are required by every other tool.
 Before bulk reorganising (moving many pages, copying sections), show the user the plan and get confirmation.
-The API cannot rename or delete notebooks/sections, or read handwriting/ink; say so rather than guessing.`;
+The API cannot rename or delete notebooks/sections, or read handwriting/ink; say so rather than guessing.
+For diagrams use insert_diagram, or fenced \`\`\`mermaid / \`\`\`svg blocks inside Markdown page content; they become images on the page.`;
 
 export function createApp(cfg: Config, store: KVStore) {
   const provider = new OneNoteAuthProvider(cfg, store);

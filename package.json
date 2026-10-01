@@ -15,9 +15,12 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
+    "@resvg/resvg-js": "^2.6.2",
     "express": "^5.2.1",
     "marked": "^18.0.14",
+    "mermaid": "^12.0.0",
     "pg": "^8.23.1",
+    "playwright-core": "^1.63.0",
     "turndown": "^7.2.4",
     "zod": "^4.6.5"
   },

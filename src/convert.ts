@@ -1,5 +1,6 @@
 import TurndownService from "turndown";
-import { Marked, type Token } from "marked";
+import { Marked, type Token, type Tokens } from "marked";
+import { renderDiagram, DiagramError, type DiagramKind } from "./diagrams.js";
 import { escapeHtml } from "./pages.js";
 
 // ---------- OneNote HTML -> Markdown (for reading) ----------
@@ -89,17 +90,78 @@ md.use({
   },
 });
 
-export function markdownToOneNoteHtml(markdown: string): string {
-  let html = md.parse(markdown, { async: false }) as string;
+export interface PageImage {
+  /** Multipart part name, referenced from HTML as src="name:<name>" */
+  name: string;
+  png: Buffer;
+}
+
+export interface PreparedContent {
+  html: string;
+  images: PageImage[];
+}
+
+const MAX_DIAGRAMS = 12;
+const DIAGRAM_LANGS: Record<string, DiagramKind> = { mermaid: "mermaid", svg: "svg" };
+
+/** Diagrams pre-rendered for specific code tokens; read synchronously by the `code` renderer. */
+const renderedForToken = new WeakMap<object, { name: string; width: number; alt: string }>();
+
+md.use({
+  renderer: {
+    code(token) {
+      const img = renderedForToken.get(token);
+      if (!img) return false;
+      return `<p><img src="name:${img.name}" width="${img.width}" alt="${escapeHtml(img.alt)}" /></p>`;
+    },
+  },
+});
+
+function diagramKind(lang?: string): DiagramKind | undefined {
+  return DIAGRAM_LANGS[(lang ?? "").trim().split(/\s+/)[0].toLowerCase()];
+}
+
+/**
+ * Convert Markdown to the HTML subset OneNote accepts.
+ * - GitHub task lists become native OneNote to-do checkboxes.
+ * - ```mermaid and ```svg code blocks are rendered to PNG images uploaded with the page.
+ */
+export async function prepareMarkdown(markdown: string, namePrefix = "diagram"): Promise<PreparedContent> {
+  const tokens = md.lexer(markdown);
+  const diagrams: { token: Tokens.Code; kind: DiagramKind }[] = [];
+  md.walkTokens(tokens, (t) => {
+    if (t.type === "code") {
+      const kind = diagramKind((t as Tokens.Code).lang);
+      if (kind) diagrams.push({ token: t as Tokens.Code, kind });
+    }
+  });
+  if (diagrams.length > MAX_DIAGRAMS) throw new DiagramError(`Too many diagrams in one request (max ${MAX_DIAGRAMS}). Split it into several calls.`);
+
+  const images: PageImage[] = [];
+  for (const [i, d] of diagrams.entries()) {
+    const name = `${namePrefix}${i + 1}`;
+    const alt = (d.token.lang ?? "").trim().split(/\s+/).slice(1).join(" ") || `${d.kind} diagram`;
+    let rendered;
+    try {
+      rendered = await renderDiagram(d.kind, d.token.text, alt);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new DiagramError(`Diagram ${i + 1} (${d.kind}) failed to render. ${msg}`);
+    }
+    images.push({ name, png: rendered.png });
+    renderedForToken.set(d.token, { name, width: rendered.width, alt });
+  }
+
+  let html = md.parser(tokens) as string;
   // OneNote ignores <pre> styling without a font; give code blocks a monospace face.
   html = html.replace(/<pre><code[^>]*>/g, '<pre style="font-family:Consolas,monospace"><code>');
   // Make tables visible.
   html = html.replace(/<table>/g, '<table border="1">');
-  return html;
+  return { html, images };
 }
 
-export function contentToHtml(content: string, format: "markdown" | "html"): string {
-  return format === "html" ? content : markdownToOneNoteHtml(content);
+export async function prepareContent(content: string, format: "markdown" | "html", namePrefix?: string): Promise<PreparedContent> {
+  return format === "html" ? { html: content, images: [] } : prepareMarkdown(content, namePrefix);
 }
 
 export function buildPageHtml(title: string, bodyHtml: string): string {

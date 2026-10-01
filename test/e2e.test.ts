@@ -8,6 +8,11 @@ import { createApp } from "../src/server.js";
 import { MemoryStore, PostgresStore } from "../src/store.js";
 import type { Config } from "../src/config.js";
 import { startFakeMicrosoft, PNG } from "./fake-microsoft.js";
+import { existsSync } from "node:fs";
+import { closeBrowser } from "../src/diagrams.js";
+
+const LOCAL_CHROMIUM = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome";
+if (!process.env.CHROMIUM_PATH && existsSync(LOCAL_CHROMIUM)) process.env.CHROMIUM_PATH = LOCAL_CHROMIUM;
 
 let fake: Awaited<ReturnType<typeof startFakeMicrosoft>>;
 let server: Server;
@@ -26,6 +31,7 @@ before(async () => {
 });
 
 after(async () => {
+  await closeBrowser();
   server?.close();
   if (store instanceof PostgresStore) await (store as any).pool.end();
   fake?.server.close();
@@ -181,7 +187,7 @@ test("full OneNote workflow through MCP", async () => {
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
     "append_to_page", "copy_section", "create_notebook", "create_page", "create_section", "create_section_group",
-    "delete_page", "get_notebook_structure", "get_page_resource", "list_notebooks", "list_pages", "move_page",
+    "delete_page", "get_notebook_structure", "get_page_resource", "insert_diagram", "list_notebooks", "list_pages", "move_page",
     "read_page", "search_pages", "update_page", "whoami",
   ]);
   const del = (await client.listTools()).tools.find((t) => t.name === "delete_page")!;
@@ -319,4 +325,91 @@ test("Microsoft tokens are encrypted at rest", async () => {
     : JSON.stringify((await (store as any).pool.query("SELECT * FROM kv")).rows);
   assert.ok(!/msrt\d+/.test(dump), "no plaintext Microsoft refresh tokens in storage");
   assert.ok(!/msat\d+/.test(dump), "no plaintext Microsoft access tokens in storage");
+});
+
+const isPng = (b: Buffer) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+test("diagrams: Mermaid and SVG blocks become images on the page", async () => {
+  const { client_id } = await register();
+  const { access_token } = await signIn(client_id);
+  const { client, call } = await mcp(access_token);
+
+  const created = await call("create_page", {
+    section_id: "s2",
+    title: "Control systems",
+    content: [
+      "## Loop",
+      "```mermaid Closed-loop motor control",
+      "flowchart LR",
+      "  Setpoint --> Controller --> Motor --> Sensor --> Controller",
+      "```",
+      "## Free-body diagram",
+      "```svg",
+      '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect x="70" y="70" width="60" height="60" fill="#ddd" stroke="#000"/>' +
+        '<line x1="100" y1="130" x2="100" y2="190" stroke="red" stroke-width="3"/><text x="105" y="180" font-size="14">mg</text></svg>',
+      "```",
+      "```python",
+      "print('normal code stays code')",
+      "```",
+    ].join("\n"),
+  });
+  assert.equal(created.isError, undefined, created.text);
+  assert.equal(created.data.diagrams, 2);
+
+  const upload = fake.multipartLog.at(-1)!.parts;
+  assert.ok(upload.Presentation, "multipart has Presentation part");
+  assert.ok(isPng(upload.diagram1.data) && upload.diagram1.type === "image/png");
+  assert.ok(isPng(upload.diagram2.data));
+  const presentation = upload.Presentation.data.toString();
+  assert.match(presentation, /<img src="name:diagram1" width="\d+" alt="Closed-loop motor control" \/>/);
+  assert.match(presentation, /<img src="name:diagram2" width="200" alt="svg diagram" \/>/);
+  assert.match(presentation, /print\(&#39;normal code stays code&#39;\)/);
+
+  // Reading it back shows image references that can be fetched.
+  const page = (await call("read_page", { page_id: created.data.page_id })).text;
+  const refs = [...page.matchAll(/onenote-resource:([\w]+)/g)].map((m) => m[1]);
+  assert.equal(refs.length, 2);
+  const img: any = await client.callTool({ name: "get_page_resource", arguments: { resource_id: refs[0] } });
+  assert.equal(img.content[0].type, "image");
+
+  // insert_diagram appends to an existing page via multipart PATCH.
+  const added = await call("insert_diagram", { page_id: "p1", kind: "mermaid", source: "stateDiagram-v2\n  [*] --> Idle\n  Idle --> Run", caption: "Robot states" });
+  assert.equal(added.isError, undefined, added.text);
+  const patch = fake.multipartLog.at(-1)!.parts;
+  assert.ok(patch.Commands && isPng(patch.diagram1.data));
+  assert.match(fake.pages.p1.body, /onenote\/resources\/res\d+/);
+  assert.match(fake.pages.p1.body, /<em>Robot states<\/em>/);
+
+  // insert_diagram can also create a new page.
+  const fresh = await call("insert_diagram", { section_id: "s1", kind: "svg", source: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>', title: "Circle" });
+  assert.equal(fake.pages[fresh.data.page_id].title, "Circle");
+
+  // update_page edits can carry diagrams too.
+  const upd = await call("update_page", { page_id: "p1", edits: [{ target: "#intro", action: "replace", content: "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><rect width=\"20\" height=\"20\"/></svg>\n```" }] });
+  assert.equal(upd.isError, undefined, upd.text);
+  assert.ok(fake.multipartLog.at(-1)!.parts.edit1diagram1);
+
+  // Errors are reported so Claude can fix the source; nothing is written.
+  const before = Object.keys(fake.pages).length;
+  const badMermaid = await call("create_page", { section_id: "s1", title: "x", content: "```mermaid\nflowchart LR\n  A -->\n```" });
+  assert.equal(badMermaid.isError, true);
+  assert.match(badMermaid.text, /Diagram 1 \(mermaid\) failed to render\. Mermaid syntax error/);
+  const badSvg = await call("insert_diagram", { section_id: "s1", kind: "svg", source: "<svg><rect" });
+  assert.equal(badSvg.isError, true);
+  assert.match(badSvg.text, /Invalid SVG/);
+  const notSvg = await call("insert_diagram", { section_id: "s1", kind: "svg", source: "hello" });
+  assert.match(notSvg.text, /must contain an <svg> element/);
+  assert.equal(Object.keys(fake.pages).length, before);
+
+  await client.close();
+});
+
+test("diagrams: SVG can't reach the network or run scripts; Mermaid page has no network", async () => {
+  const { renderSvg, renderMermaid } = await import("../src/diagrams.js");
+  // External image href + script are ignored rather than fetched/executed.
+  const r = renderSvg('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="50" height="50"><script>alert(1)</script><image xlink:href="http://127.0.0.1:1/x.png" width="50" height="50"/></svg>');
+  assert.ok(isPng(r.png));
+  // Mermaid click directives with javascript: links are blocked by securityLevel strict and still render.
+  const m = await renderMermaid('flowchart LR\n  A --> B\n  click A "javascript:alert(1)"');
+  assert.ok(isPng(m.png));
 });

@@ -13,6 +13,7 @@ export function startFakeMicrosoft() {
   app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
   app.use(express.text({ type: ["text/html", "application/xhtml+xml"] }));
+  app.use(express.raw({ type: "multipart/form-data", limit: "20mb" }));
 
   const state = {
     codes: new Map<string, { challenge: string; redirect: string }>(),
@@ -41,6 +42,42 @@ export function startFakeMicrosoft() {
     p2: { id: "p2", title: "Random thoughts", section: "s1", order: 0, body: `<p>Eigenvalues are cool</p>` },
   };
   const ops: Record<string, { polls: number; resourceId: string }> = {};
+  const resources: Record<string, { type: string; data: Buffer }> = { r1: { type: "image/png", data: PNG } };
+  const multipartLog: { parts: Record<string, { type: string; data: Buffer }> }[] = [];
+
+  /** Minimal multipart/form-data parser (good enough for tests). */
+  function parseMultipart(req: express.Request): Record<string, { type: string; data: Buffer }> {
+    const boundary = String(req.headers["content-type"]).match(/boundary=(?:"([^"]+)"|([^;]+))/)!;
+    const sep = Buffer.from(`--${boundary[1] ?? boundary[2]}`);
+    const buf = req.body as Buffer;
+    const parts: Record<string, { type: string; data: Buffer }> = {};
+    let pos = buf.indexOf(sep);
+    while (pos !== -1) {
+      const start = pos + sep.length;
+      if (buf.subarray(start, start + 2).toString() === "--") break;
+      const next = buf.indexOf(sep, start);
+      const chunk = buf.subarray(start + 2, next - 2); // strip CRLFs
+      const headerEnd = chunk.indexOf("\r\n\r\n");
+      const headers = chunk.subarray(0, headerEnd).toString();
+      const name = headers.match(/name="([^"]+)"/)![1];
+      const type = headers.match(/Content-Type:\s*([^\r\n]+)/i)?.[1] ?? "text/plain";
+      parts[name] = { type, data: chunk.subarray(headerEnd + 4) };
+      pos = next;
+    }
+    multipartLog.push({ parts });
+    return parts;
+  }
+
+  /** Store uploaded images as resources and rewrite name:X references like OneNote does. */
+  function absorbImages(html: string, parts: Record<string, { type: string; data: Buffer }>): string {
+    return html.replace(/src="name:([^"]+)"/g, (_m, name: string) => {
+      const part = parts[name];
+      if (!part) throw new Error(`missing part ${name}`);
+      const rid = id("res");
+      resources[rid] = part;
+      return `src="https://graph.microsoft.com/v1.0/users('x')/onenote/resources/${rid}/$value"`;
+    });
+  }
 
   // ---------- identity ----------
   app.get("/common/oauth2/v2.0/authorize", (req, res) => {
@@ -130,7 +167,12 @@ export function startFakeMicrosoft() {
     res.json({ value: Object.values(pages).filter((p) => p.title.toLowerCase().includes(q)).map(pageJson) });
   });
   g.post("/me/onenote/sections/:id/pages", (req, res) => {
-    const html = String(req.body);
+    let html: string;
+    if (Buffer.isBuffer(req.body)) {
+      const parts = parseMultipart(req);
+      if (!parts.Presentation) return res.status(400).json({ error: { code: "20001", message: "no Presentation part" } });
+      html = absorbImages(parts.Presentation.data.toString(), parts);
+    } else html = String(req.body);
     const title = html.match(/<title>(.*?)<\/title>/)?.[1] ?? "";
     const body = html.match(/<body>([\s\S]*)<\/body>/)?.[1] ?? "";
     const p = { id: id("p"), title, section: req.params.id, body, order: 99 };
@@ -146,7 +188,14 @@ export function startFakeMicrosoft() {
   g.patch("/me/onenote/pages/:id/content", (req, res) => {
     const p = pages[req.params.id];
     if (!p) return notFound(res);
-    for (const c of req.body as any[]) {
+    let commands = req.body as any[];
+    let parts: Record<string, { type: string; data: Buffer }> = {};
+    if (Buffer.isBuffer(req.body)) {
+      parts = parseMultipart(req);
+      commands = JSON.parse(parts.Commands.data.toString());
+    }
+    for (const c of commands) {
+      if (typeof c.content === "string") c.content = absorbImages(c.content, parts);
       if (c.target === "title" && c.action === "replace") p.title = c.content;
       else if (c.target === "body" && c.action === "append") p.body += c.content;
       else if (c.target === "body" && c.action === "prepend") p.body = c.content + p.body;
@@ -181,13 +230,16 @@ export function startFakeMicrosoft() {
     op.polls++;
     res.json({ id: req.params.id, status: op.polls < 2 ? "Running" : "Completed", resourceId: op.resourceId });
   });
-  g.get("/me/onenote/resources/:id/:value", (_req, res) => res.type("image/png").send(PNG));
+  g.get("/me/onenote/resources/:id/:value", (req, res) => {
+    const r = resources[req.params.id];
+    r ? res.type(r.type).send(r.data) : notFound(res);
+  });
   app.use("/v1.0", g);
 
-  return new Promise<{ url: string; server: Server; state: typeof state; pages: typeof pages; sections: typeof sections }>((resolve) => {
+  return new Promise<{ url: string; server: Server; state: typeof state; pages: typeof pages; sections: typeof sections; resources: typeof resources; multipartLog: typeof multipartLog }>((resolve) => {
     const server = app.listen(0, "127.0.0.1", () => {
       const port = (server.address() as any).port;
-      resolve({ url: `http://127.0.0.1:${port}`, server, state, pages, sections });
+      resolve({ url: `http://127.0.0.1:${port}`, server, state, pages, sections, resources, multipartLog });
     });
   });
 }
